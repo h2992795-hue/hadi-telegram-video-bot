@@ -23,7 +23,7 @@ TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 MAX_UPLOAD_MB = max(1, min(int(os.getenv("MAX_UPLOAD_MB", "48")), 49))
 MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
 DOWNLOAD_TIMEOUT = max(60, min(int(os.getenv("DOWNLOAD_TIMEOUT_SECONDS", "900")), 3600))
-SAVEDLY_API = "https://savedly.net/api/upload"
+LITTERBOX_API = "https://litterbox.catbox.moe/resources/internals/api.php"
 URL_RE = re.compile(r"https?://[^\s<>]+", re.I)
 JOBS: dict[str, dict] = {}
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper(),
@@ -65,7 +65,7 @@ def quality_keyboard(job_id: str) -> InlineKeyboardMarkup:
 def delivery_keyboard(job_id: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📩 استلام داخل تلغرام", callback_data=f"d:{job_id}:tg")],
-        [InlineKeyboardButton("🔗 رابط تحميل SAVEDLY", callback_data=f"d:{job_id}:link")],
+        [InlineKeyboardButton("🔗 رابط Litterbox المؤقت", callback_data=f"d:{job_id}:link")],
         [InlineKeyboardButton("✖ إلغاء", callback_data=f"c:{job_id}")],
     ])
 
@@ -96,7 +96,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.effective_message.reply_text(
             "هلا بيك بـ HADI Video Bot PRO ⚡\n\n"
             "أرسل رابط فيديو عام، اختَر الجودة، وبعد التنزيل اختَر الاستلام داخل تلغرام "
-            "أو رابط SAVEDLY.\n\n"
+            "أو رابط Litterbox المؤقت.\n\n"
             "الجودة 4K تظهر فقط إذا كان المصدر يوفرها. البوت لا يعيد ضغط الفيديو عمداً. "
             "قد تمنع بعض المواقع التنزيل، وستوريات إنستغرام لا تعمل دائماً دون تسجيل دخول."
         )
@@ -105,7 +105,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_message:
         await update.effective_message.reply_text(
             "أرسل رابطاً عاماً يبدأ بـ https:// ثم اختَر الجودة وطريقة الاستلام.\n"
-            "SAVEDLY يقبل عبر API ملفات حتى 90 MB للطلب الواحد، ويحذف الملفات التي لا تُفتح "
+            "Litterbox يقبل عبر API ملفات حتى 90 MB للطلب الواحد، ويحذف الملفات التي لا تُفتح "
             "لمدة 7 أيام. الملفات الأكبر من ذلك لن تُرفع بهذه الطريقة."
         )
 
@@ -182,19 +182,23 @@ async def handle_quality(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     )
 
 async def upload_savedly(path: Path) -> str:
-    if path.stat().st_size > 90 * 1024 * 1024:
-        raise ValueError("SAVEDLY API limit is 90 MB per request")
-    timeout = aiohttp.ClientTimeout(total=600, connect=30)
-    headers = {"X-Filename": path.name}
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        with path.open("rb") as f:
-            async with session.post(SAVEDLY_API, params={"plain": ""}, headers=headers,
-                                    data=f) as response:
+    # Temporary Litterbox upload, maximum 1 GB, expires after 72 hours.
+    if path.stat().st_size > 1024 * 1024 * 1024:
+        raise ValueError("Litterbox limit is 1 GB per file")
+    timeout = aiohttp.ClientTimeout(total=900, connect=30)
+    form = aiohttp.FormData()
+    form.add_field("reqtype", "fileupload")
+    form.add_field("time", "72h")
+    with path.open("rb") as f:
+        form.add_field("fileToUpload", f, filename=path.name,
+                       content_type="application/octet-stream")
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(LITTERBOX_API, data=form) as response:
                 body = (await response.text()).strip()
                 if response.status != 200:
-                    raise RuntimeError(f"SAVEDLY HTTP {response.status}: {body[:300]}")
-                if not body.startswith("https://savedly.net/"):
-                    raise RuntimeError(f"Unexpected SAVEDLY response: {body[:300]}")
+                    raise RuntimeError(f"Litterbox HTTP {response.status}: {body[:300]}")
+                if not body.startswith("https://litter.catbox.moe/"):
+                    raise RuntimeError(f"Unexpected Litterbox response: {body[:300]}")
                 return body
 
 async def handle_delivery(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -219,17 +223,17 @@ async def handle_delivery(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     try:
         for path in files:
             if mode == "link":
-                await q.message.reply_text(f"⏳ جارٍ رفع {path.name} إلى SAVEDLY…")
+                await q.message.reply_text(f"⏳ جارٍ رفع {path.name} إلى Litterbox…")
                 link = await upload_savedly(path)
                 await q.message.reply_text(
                     f"🔗 رابط تحميل الملف الأصلي ({path.stat().st_size / 1024 / 1024:.1f} MB):\n{link}\n\n"
-                    "تنبيه: SAVEDLY يحذف الملفات التي لا تُفتح لمدة 7 أيام. لا تستخدم الرابط كنسخة احتياطية."
+                    "تنبيه: الرابط مؤقت وينتهي بعد 72 ساعة. نزّل الملف قبل انتهاء المدة."
                 )
             elif mode == "tg":
                 if path.stat().st_size > MAX_UPLOAD_BYTES:
                     await q.message.reply_text(
                         f"حجم الملف {path.stat().st_size / 1024 / 1024:.1f} MB ويتجاوز حد تيليگرام "
-                        f"المضبوط ({MAX_UPLOAD_MB} MB). اختَر رابط SAVEDLY."
+                        f"المضبوط ({MAX_UPLOAD_MB} MB). اختَر رابط Litterbox المؤقت."
                     )
                     continue
                 await context.bot.send_chat_action(chat_id=q.message.chat_id, action=ChatAction.UPLOAD_DOCUMENT)
@@ -243,7 +247,7 @@ async def handle_delivery(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     except Exception as e:
         log.exception("Delivery failed: %s", e)
         await q.message.reply_text(
-            "تعذّر تسليم الملف. قد يكون حجمه أكبر من حد SAVEDLY API (90 MB) أو حدث خطأ بالموقع."
+            "تعذّر تسليم الملف. قد يكون حجمه أكبر من حد Litterbox (1 GB) أو حدث خطأ بالموقع."
         )
     finally:
         shutil.rmtree(job.get("folder") or "", ignore_errors=True)
