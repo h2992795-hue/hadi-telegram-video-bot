@@ -6,6 +6,7 @@ import os
 import re
 import tempfile
 import shutil
+import subprocess
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -181,6 +182,25 @@ async def handle_quality(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         reply_markup=delivery_keyboard(job_id)
     )
 
+
+def strip_audio_stream_copy(path: Path) -> Path:
+    """Remove audio tracks without re-encoding the video stream."""
+    output = path.with_name(path.stem + "-no-audio.mp4")
+    cmd = [
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+        "-i", str(path), "-map", "0:v:0", "-c:v", "copy",
+        "-an", "-movflags", "+faststart", str(output)
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+    if result.returncode != 0 or not output.exists() or output.stat().st_size == 0:
+        try:
+            output.unlink(missing_ok=True)
+        except Exception:
+            pass
+        raise RuntimeError("FFmpeg failed to remove audio: " + (result.stderr[-500:] or "unknown error"))
+    return output
+
+
 async def upload_savedly(path: Path) -> str:
     # Temporary Litterbox upload, maximum 1 GB, expires after 72 hours.
     if path.stat().st_size > 1024 * 1024 * 1024:
@@ -222,6 +242,9 @@ async def handle_delivery(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     sent = 0
     try:
         for path in files:
+            # Produce a silent copy by removing audio tracks while copying video without re-encoding.
+            silent_path = await asyncio.to_thread(strip_audio_stream_copy, path)
+            path = silent_path
             if mode == "link":
                 await q.message.reply_text(f"⏳ جارٍ رفع {path.name} إلى Litterbox…")
                 link = await upload_savedly(path)
